@@ -6,14 +6,14 @@
 use std::error::Error;
 use std::io::Cursor;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::CODEC_TYPE_NULL;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::AudioCodecParameters;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::CODEC_ID_NULL_AUDIO;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::Track;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Contains monophonic audio data decoded to f32 samples, along with the data's sample rate
 pub struct MonoAudioData {
@@ -61,39 +61,37 @@ fn load_audio_from_source_stream(
         };
 
         // Probe the file data to discover its format
-        let probe = symphonia::default::get_probe().format(
+        symphonia::default::get_probe().probe(
             &probe_hint,
             source_stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )?;
-
-        probe.format
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )?
     };
 
-    let track = first_supported_track(format_reader.tracks())
+    let (track, codec_params) = first_supported_track(format_reader.tracks())
         .ok_or_else(|| "Failed to get default audio track".to_string())?;
 
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions { verify: true })?;
+    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(
+        codec_params,
+        &AudioDecoderOptions::default().verify(true).gapless(false),
+    )?;
 
     let track_id = track.id;
-    let sample_rate = track
-        .codec_params
+    let sample_rate = codec_params
         .sample_rate
         .ok_or_else(|| "Failed to get sample rate".to_string())? as usize;
-    let channels = track
-        .codec_params
+    let channels = codec_params
         .channels
+        .as_ref()
         .ok_or_else(|| "Failed to get number of channels".to_string())?
         .count();
     let total_frames = track
-        .codec_params
-        .n_frames
+        .num_frames
         .ok_or_else(|| "Failed to get number of frames".to_string())?
         as usize;
 
-    let mut sample_buffer = None;
+    let mut sample_buffer = Vec::new();
     let mut mono_data = Vec::new();
 
     // We need to keep track of the decoded frame count in case the decoder provides additional
@@ -101,8 +99,8 @@ fn load_audio_from_source_stream(
     let mut frame_count = 0;
 
     // Read each packet in the format reader
-    while let Ok(packet) = format_reader.next_packet() {
-        if packet.track_id() != track_id {
+    while let Ok(Some(packet)) = format_reader.next_packet() {
+        if packet.track_id != track_id {
             // Skip over packets that belong to another track
             continue;
         }
@@ -110,20 +108,13 @@ fn load_audio_from_source_stream(
         // Decode the packet, resulting in an audio buffer
         match decoder.decode(&packet) {
             Ok(audio_buffer) => {
-                // Prepare the sample buffer that we'll copy data into from the audio buffer
-                let sample_buffer = sample_buffer.get_or_insert_with(|| {
-                    let spec = *audio_buffer.spec();
-                    let duration = audio_buffer.capacity() as u64;
-                    SampleBuffer::<f32>::new(duration, spec)
-                });
-
                 // Limit the number of frames to avoid running past the end of the file's declared
                 // frame count.
                 let packet_frames = audio_buffer.frames().min(total_frames - frame_count);
                 frame_count += packet_frames;
 
-                sample_buffer.copy_interleaved_ref(audio_buffer);
-                let samples = &sample_buffer.samples()[..(packet_frames * channels)];
+                audio_buffer.copy_to_vec_interleaved(&mut sample_buffer);
+                let samples = &sample_buffer[..(packet_frames * channels)];
 
                 if channels == 1 {
                     mono_data.extend_from_slice(samples);
@@ -153,10 +144,11 @@ fn load_audio_from_source_stream(
     })
 }
 
-fn first_supported_track(tracks: &[Track]) -> Option<&Track> {
-    tracks
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+fn first_supported_track(tracks: &[Track]) -> Option<(&Track, &AudioCodecParameters)> {
+    tracks.iter().find_map(|t| {
+        let codec_params = t.codec_params.as_ref()?.audio()?;
+        (codec_params.codec != CODEC_ID_NULL_AUDIO).then_some((t, codec_params))
+    })
 }
 
 #[cfg(test)]
